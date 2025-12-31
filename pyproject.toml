@@ -8,8 +8,13 @@ dependencies = [
     "genesis-world",
     "numpy",
     "torch>=2.9.1",
-    "xacro",
+    "markupsafe<3.0.0",  # Pin to version compatible with Python 3.11
 ]
 
+# pyproject.toml
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+
 [tool.uv.sources]
-xacro = { git = "https://github.com/ros/xacro.git", rev = "ros2" }
+torch = { index = "pytorch-cu128" }
