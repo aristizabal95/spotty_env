@@ -34,7 +34,7 @@ class SpottyEnv:
     - 1.0 maps to the maximum joint angle (upper limit)
     """
     
-    def __init__(self, dt=0.01, kp_gain=8000.0, kv_gain=20.0, 
+    def __init__(self, dt=0.01, kp_gain=16000.0, kv_gain=0.0, 
                  show_viewer=True, fixed_base=False, joint_reverse=None,
                  num_scene_steps_per_env_step=1):
         """
@@ -90,7 +90,7 @@ class SpottyEnv:
                 camera_pos=(3.5, 0.0, 2.5),
                 camera_lookat=(0.0, 0.0, 0.5),
                 camera_fov=40,
-                max_FPS=60,
+                max_FPS=100,
             ),
             show_viewer=self.show_viewer,
         )
@@ -134,7 +134,9 @@ class SpottyEnv:
         # Set up PD control
         self._setup_control()
 
-        self.initial_dofs_position = self.robot.get_dofs_position()
+        # Get initial DOF positions and convert to numpy array (handles CUDA tensors)
+        initial_pos = self.robot.get_dofs_position()
+        self.initial_dofs_position = initial_pos.cpu().numpy()
         
         print(f"SpottyEnv initialized with {self.num_actions} controllable joints")
         print(f"Joint reversal vector: {self.joint_reverse}")
@@ -277,30 +279,30 @@ class SpottyEnv:
         
         # Get current joint positions and velocities
         if hasattr(self.robot, 'get_dofs_position'):
-            obs['joint_positions'] = np.array(
-                self.robot.get_dofs_position(self.motors_dof_idx)
-            )
+            joint_pos = self.robot.get_dofs_position(self.motors_dof_idx)
+            obs['joint_positions'] = joint_pos.cpu().numpy()
             obs['normalized_positions'] = self.joint_angles_to_normalized(
                 obs['joint_positions']
             )
         
         if hasattr(self.robot, 'get_dofs_velocity'):
-            obs['joint_velocities'] = np.array(
-                self.robot.get_dofs_velocity(self.motors_dof_idx)
-            )
+            joint_vel = self.robot.get_dofs_velocity(self.motors_dof_idx)
+            obs['joint_velocities'] = joint_vel.cpu().numpy()
         else:
-            obs['joint_velocities'] = np.zeros(self.num_actions)
+            obs['joint_velocities'] = np.zeros(self.num_actions, dtype=np.float32)
         
         # Get base pose if available
         if hasattr(self.robot, 'get_pos'):
-            obs['base_position'] = np.array(self.robot.get_pos())
+            base_pos = self.robot.get_pos()
+            obs['base_position'] = base_pos.cpu().numpy()
         else:
-            obs['base_position'] = np.array([0.0, 0.0, 0.0])
+            obs['base_position'] = np.array([0.0, 0.0, 0.0], dtype=np.float32)
         
         if hasattr(self.robot, 'get_quat'):
-            obs['base_quaternion'] = np.array(self.robot.get_quat())
+            base_quat = self.robot.get_quat()
+            obs['base_quaternion'] = base_quat.cpu().numpy()
         else:
-            obs['base_quaternion'] = np.array([1.0, 0.0, 0.0, 0.0])
+            obs['base_quaternion'] = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
         
         return obs
     
@@ -315,10 +317,10 @@ class SpottyEnv:
         Returns:
             dict: Initial observations
         """
-        # Reset robot to initial pose
+        # Reset robot to initial pose (initial_dofs_position is already numpy array)
         self.robot.set_dofs_position(self.initial_dofs_position)
         
-        # Reset velocities if possible
+        # Reset velocities if possible (initial_dofs_position is numpy, so zeros_like works)
         zero_velocities = np.zeros_like(self.initial_dofs_position)
         self.robot.set_dofs_velocity(zero_velocities)
         
