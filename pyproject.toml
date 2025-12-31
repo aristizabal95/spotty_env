@@ -1,0 +1,15 @@
+[project]
+name = "spotty-env"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "genesis-world",
+    "numpy",
+    "torch>=2.9.1",
+    "xacro",
+]
+
+[tool.uv.sources]
+xacro = { git = "https://github.com/ros/xacro.git", rev = "ros2" }
