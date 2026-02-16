@@ -8,13 +8,6 @@ dependencies = [
     "genesis-world",
     "numpy",
     "torch>=2.9.1",
-    "markupsafe<3.0.0",  # Pin to version compatible with Python 3.11
+    "markupsafe<3.0.0", # Pin to version compatible with Python 3.11
+    "matplotlib>=3.10.8",
 ]
-
-# pyproject.toml
-[[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
-
-[tool.uv.sources]
-torch = { index = "pytorch-cu128" }

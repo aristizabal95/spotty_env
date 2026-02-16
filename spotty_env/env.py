@@ -28,39 +28,59 @@ except ImportError as exc:
 class SpottyEnv:
     """
     Environment for controlling the Spotty robot in Genesis simulator.
-    
+
     Actions are normalized to [0, 1] range, where:
     - 0.0 maps to the minimum joint angle (lower limit)
     - 1.0 maps to the maximum joint angle (upper limit)
+
+    Rendering follows Gymnasium conventions:
+    - render_mode=None (default): headless, no display or camera.
+    - render_mode="human": interactive viewer in a separate window.
+    - render_mode="rgb_array": headless; render() returns an RGB array (e.g. for matplotlib).
     """
-    
-    def __init__(self, dt=0.01, kp_gain=16000.0, kv_gain=0.0, 
-                 show_viewer=True, fixed_base=False, joint_reverse=None,
-                 num_scene_steps_per_env_step=1):
+
+    metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 60}
+
+    def __init__(
+        self,
+        dt=0.01,
+        kp_gain=16000.0,
+        kv_gain=0.0,
+        render_mode=None,
+        fixed_base=False,
+        joint_reverse=None,
+        num_scene_steps_per_env_step=1,
+        n_envs=1,
+        env_spacing=(1.0, 1.0),
+        render_res=(640, 480),
+    ):
         """
         Initialize the Spotty environment.
-        
+
         Args:
             dt: Simulation time step in seconds (default: 0.01 = 100 Hz)
             kp_gain: Proportional gain for PD controller (default: 8000.0)
-            kv_gain: Derivative gain for PD controller (default: 200.0,
-                    approximately 1/40 of kp for balanced response)
-            show_viewer: Whether to show the visualization window (default: True)
+            kv_gain: Derivative gain for PD controller (default: 200.0)
+            render_mode: None (headless), "human" (viewer window), or "rgb_array"
+                        (headless; render() returns RGB array for matplotlib).
             fixed_base: Whether to fix the base link to the world (default: False)
             joint_reverse: Vector of size 12 with 1 or 0 indicating if a joint
-                          needs to be reversed. 1 means reverse (1.0 - action),
-                          0 means no reversal. If None, defaults to all zeros.
-            num_scene_steps_per_env_step: Number of physics scene steps to
-                                         execute per environment step (default: 1).
-                                         This simulates real-life scenarios where
-                                         each env step happens over a few
-                                         milliseconds. Higher values provide
-                                         finer physics simulation.
+                          needs to be reversed. If None, defaults to all zeros.
+            num_scene_steps_per_env_step: Number of physics scene steps per env step.
+            n_envs: Number of parallel environments to simulate (default: 1).
+            env_spacing: (x, y) spacing between environment origins (default: (1.0, 1.0)).
+            render_res: (width, height) for rgb_array rendering (default: (640, 480)).
         """
+        if render_mode is not None and render_mode not in self.metadata["render_modes"]:
+            raise ValueError(
+                f"render_mode must be one of {self.metadata['render_modes']}, got {render_mode!r}"
+            )
+        self.render_mode = render_mode
+        self._render_res = render_res
+
         self.dt = dt
         self.kp_gain = kp_gain
         self.kv_gain = kv_gain
-        self.show_viewer = show_viewer
         self.fixed_base = fixed_base
         self.num_scene_steps_per_env_step = num_scene_steps_per_env_step
         
@@ -74,7 +94,12 @@ class SpottyEnv:
                 "Please ensure the URDF file exists."
             )
         
-        # Create scene
+        # Viewer only for "human" mode; headless otherwise
+        show_viewer = self.render_mode == "human"
+        self._camera_pos = (3.5, 0.0, 2.5)
+        self._camera_lookat = (0.0, 0.0, 0.5)
+        self._camera_fov = 40
+
         self.scene = gs.Scene(
             sim_options=gs.options.SimOptions(
                 dt=self.dt,
@@ -87,21 +112,19 @@ class SpottyEnv:
                 show_cameras=False,
             ),
             viewer_options=gs.options.ViewerOptions(
-                camera_pos=(3.5, 0.0, 2.5),
-                camera_lookat=(0.0, 0.0, 0.5),
-                camera_fov=40,
-                max_FPS=100,
+                camera_pos=self._camera_pos,
+                camera_lookat=self._camera_lookat,
+                camera_fov=self._camera_fov,
+                max_FPS=self.metadata["render_fps"],
             ),
-            show_viewer=self.show_viewer,
+            show_viewer=show_viewer,
         )
-        
+
         # Add ground plane
         self.scene.add_entity(
-            morph=gs.morphs.Plane(
-                pos=(0.0, 0.0, 0.0)
-            )
+            morph=gs.morphs.Plane(pos=(0.0, 0.0, 0.0))
         )
-        
+
         # Add robot
         self.robot = self.scene.add_entity(
             morph=gs.morphs.URDF(
@@ -112,10 +135,22 @@ class SpottyEnv:
                 fixed=self.fixed_base,
             )
         )
-        
+
+        # Headless camera for rgb_array; must be added before build()
+        self._render_camera = None
+        if self.render_mode == "rgb_array":
+            self._render_camera = self.scene.add_camera(
+                res=self._render_res,
+                pos=self._camera_pos,
+                lookat=self._camera_lookat,
+                fov=self._camera_fov,
+                GUI=False,
+            )
+
         # Build scene
-        self.scene.build()
-        
+        self.scene.build(n_envs=n_envs, env_spacing=env_spacing)
+        self.n_envs = self.scene.n_envs
+
         # Identify controllable joints and get their limits
         self._setup_joints()
         
@@ -138,7 +173,10 @@ class SpottyEnv:
         initial_pos = self.robot.get_dofs_position()
         self.initial_dofs_position = initial_pos.cpu().numpy()
         
-        print(f"SpottyEnv initialized with {self.num_actions} controllable joints")
+        print(
+            f"SpottyEnv initialized with {self.num_actions} controllable joints "
+            f"and {self.n_envs} parallel envs"
+        )
         print(f"Joint reversal vector: {self.joint_reverse}")
     
     def _setup_joints(self):
@@ -185,125 +223,144 @@ class SpottyEnv:
     def normalized_to_joint_angles(self, actions):
         """
         Convert normalized actions [0, 1] to joint angles in radians.
-        
+
+        Supports both single-env and batched actions for parallel simulation.
+
         Args:
-            actions: Array of shape (num_actions,) with values in [0, 1]
-                    or list of 12 values between 0 and 1
-        
+            actions: Array of shape (num_actions,) or (n_envs, num_actions)
+                    with values in [0, 1]. If 1D, the same action is applied
+                    to all envs.
+
         Returns:
-            Array of joint angles in radians
+            Array of joint angles in radians, shape (n_envs, num_actions)
         """
-        actions = np.array(actions, dtype=np.float32)
-        
-        if actions.shape != (self.num_actions,):
+        actions = np.asarray(actions, dtype=np.float32)
+        if actions.ndim == 1:
+            if actions.shape != (self.num_actions,):
+                raise ValueError(
+                    f"Actions must have shape ({self.num_actions},) or "
+                    f"({self.n_envs}, {self.num_actions}), got {actions.shape}"
+                )
+            actions = np.broadcast_to(
+                actions[np.newaxis, :], (self.n_envs, self.num_actions)
+            ).copy()
+        elif actions.ndim == 2:
+            if actions.shape != (self.n_envs, self.num_actions):
+                raise ValueError(
+                    f"Batched actions must have shape ({self.n_envs}, {self.num_actions}), "
+                    f"got {actions.shape}"
+                )
+        else:
             raise ValueError(
-                f"Actions must have shape ({self.num_actions},), "
-                f"got {actions.shape}"
+                f"Actions must be 1D or 2D, got ndim={actions.ndim}"
             )
-        
+
         # Clamp actions to [0, 1]
         actions = np.clip(actions, 0.0, 1.0)
-        # Reverse actions based on joint_reverse vector
-        actions = abs(actions - self.joint_reverse)
-        
+        # Reverse actions based on joint_reverse vector (broadcasts over envs)
+        actions = np.abs(actions - self.joint_reverse)
+
         # Linear interpolation: 0 -> lower_limit, 1 -> upper_limit
         joint_angles = (
-            self.joint_lower_limits + 
-            actions * (self.joint_upper_limits - self.joint_lower_limits)
+            self.joint_lower_limits
+            + actions * (self.joint_upper_limits - self.joint_lower_limits)
         )
-        
         return joint_angles
     
     def joint_angles_to_normalized(self, joint_angles):
         """
         Convert joint angles in radians to normalized actions [0, 1].
-        
+
+        Accepts both single-env and batched joint angles (from get_dofs_position).
+
         Args:
-            joint_angles: Array of joint angles in radians
-        
+            joint_angles: Array of shape (num_actions,) or (n_envs, num_actions)
+
         Returns:
-            Array of normalized actions in [0, 1]
+            Array of normalized actions in [0, 1], same shape as input
         """
-        joint_angles = np.array(joint_angles, dtype=np.float32)
-        
-        # Inverse linear interpolation
+        joint_angles = np.asarray(joint_angles, dtype=np.float32)
+        # Inverse linear interpolation (limits broadcast over env dim if 2D)
         actions = (
-            (joint_angles - self.joint_lower_limits) / 
-            (self.joint_upper_limits - self.joint_lower_limits)
+            (joint_angles - self.joint_lower_limits)
+            / (self.joint_upper_limits - self.joint_lower_limits)
         )
-        
-        # Clamp to [0, 1]
         actions = np.clip(actions, 0.0, 1.0)
-        actions = abs(actions - self.joint_reverse)
-        
+        actions = np.abs(actions - self.joint_reverse)
         return actions
     
     def step(self, actions):
         """
         Step the simulation with normalized actions.
-        
+
         Args:
-            actions: Array or list of 12 values in [0, 1] representing
-                    normalized joint positions
-        
+            actions: Array of shape (num_actions,) or (n_envs, num_actions)
+                    in [0, 1]. If 1D, the same action is applied to all envs.
+
         Returns:
-            dict: Dictionary containing observation information
+            dict: Batched observations; each value has shape (n_envs, ...).
         """
-        # Convert normalized actions to joint angles
         joint_angles = self.normalized_to_joint_angles(actions)
-        
-        # Step simulation multiple times to simulate fine-grained physics
-        # Apply control at each physics step for faster response
+        # Genesis expects first dimension = n_envs; ensure contiguous array
+        joint_angles = np.ascontiguousarray(joint_angles, dtype=np.float32)
+
         for _ in range(self.num_scene_steps_per_env_step):
-            # Apply control at each physics step - this allows the PD controller
-            # to update more frequently and respond faster
             self.robot.control_dofs_position(
                 joint_angles,
-                self.motors_dof_idx
+                self.motors_dof_idx,
             )
             self.scene.step()
-        
-        # Get current state
-        obs = self.get_observations()
-        
-        return obs
+
+        return self.get_observations()
     
     def get_observations(self):
         """
-        Get current observations from the robot.
-        
+        Get current observations from the robot (batched over n_envs).
+
         Returns:
-            dict: Dictionary containing current observations
+            dict: Each value has shape (n_envs, ...).
         """
         obs = {}
-        
-        # Get current joint positions and velocities
+
         if hasattr(self.robot, 'get_dofs_position'):
             joint_pos = self.robot.get_dofs_position(self.motors_dof_idx)
             obs['joint_positions'] = joint_pos.cpu().numpy()
             obs['normalized_positions'] = self.joint_angles_to_normalized(
                 obs['joint_positions']
             )
-        
+        else:
+            obs['joint_positions'] = np.zeros(
+                (self.n_envs, self.num_actions), dtype=np.float32
+            )
+            obs['normalized_positions'] = np.zeros(
+                (self.n_envs, self.num_actions), dtype=np.float32
+            )
+
         if hasattr(self.robot, 'get_dofs_velocity'):
             joint_vel = self.robot.get_dofs_velocity(self.motors_dof_idx)
             obs['joint_velocities'] = joint_vel.cpu().numpy()
         else:
-            obs['joint_velocities'] = np.zeros(self.num_actions, dtype=np.float32)
-        
-        # Get base pose if available
+            obs['joint_velocities'] = np.zeros(
+                (self.n_envs, self.num_actions), dtype=np.float32
+            )
+
         if hasattr(self.robot, 'get_pos'):
             base_pos = self.robot.get_pos()
             obs['base_position'] = base_pos.cpu().numpy()
         else:
-            obs['base_position'] = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-        
+            obs['base_position'] = np.zeros(
+                (self.n_envs, 3), dtype=np.float32
+            )
+
         if hasattr(self.robot, 'get_quat'):
             base_quat = self.robot.get_quat()
             obs['base_quaternion'] = base_quat.cpu().numpy()
         else:
-            obs['base_quaternion'] = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-        
+            obs['base_quaternion'] = np.zeros(
+                (self.n_envs, 4), dtype=np.float32
+            )
+            obs['base_quaternion'][:, 0] = 1.0
+
         return obs
     
     def reset(self):
@@ -328,6 +385,32 @@ class SpottyEnv:
         
         return self.get_observations()
     
+    def render(self):
+        """
+        Render the current state.
+
+        Returns:
+            None if render_mode is None or "human".
+            np.ndarray of shape (height, width, 3) uint8 RGB if render_mode is "rgb_array"
+            (suitable for matplotlib.imshow or saving).
+        """
+        if self.render_mode is None:
+            return None
+        if self.render_mode == "human":
+            # Viewer updates automatically on scene.step(); nothing to return
+            return None
+        if self.render_mode == "rgb_array":
+            out = self._render_camera.render()
+            rgb = out[0] if isinstance(out, (list, tuple)) else out
+            if hasattr(rgb, "cpu"):
+                rgb = rgb.cpu().numpy()
+            rgb = np.asarray(rgb, dtype=np.uint8)
+            # Ensure (H, W, 3) for matplotlib (batch dim if present)
+            if rgb.ndim == 4:
+                rgb = rgb[0]
+            return rgb
+        return None
+
     def close(self):
         """Close the environment and cleanup resources."""
         # Genesis will handle cleanup when scene is garbage collected
@@ -335,39 +418,74 @@ class SpottyEnv:
 
 
 def main():
-    """Example usage of SpottyEnv."""
-    # Create environment
-    env = SpottyEnv(show_viewer=True, num_scene_steps_per_env_step=10)
-    
-    print("\n=== Example: Moving joints with normalized actions ===")
-    
-    # Reset to default (middle positions)
+    """Example usage of SpottyEnv with parallel simulation and rendering."""
+    import sys
+
+    # Default: headless. Use --human for viewer, --rgb for rgb_array + matplotlib
+    render_mode = None
+    if "--human" in sys.argv:
+        render_mode = "human"
+    elif "--rgb" in sys.argv:
+        render_mode = "rgb_array"
+
+    env = SpottyEnv(
+        render_mode=render_mode,
+        num_scene_steps_per_env_step=10,
+        n_envs=10,
+    )
+
+    print("\n=== Example: Moving joints with normalized actions (batched) ===")
+    print(f"Render mode: {env.render_mode!r}")
+
     obs = env.reset()
-    print(f"Initial normalized positions: {obs['normalized_positions']}")
-    
-    # Example: Move all joints to maximum
-    print("\nMoving all joints to maximum (1.0)...")
-    for step in range(100):
-        actions = np.ones(env.num_actions)  # All joints at maximum
+    print(f"Initial normalized positions shape: {obs['normalized_positions'].shape}")
+    print(f"Initial normalized positions (env 0): {obs['normalized_positions'][0]}")
+
+    # Same action for all envs: pass (num_actions,) and it is broadcast
+    print("\nMoving all joints to maximum (1.0) in all envs...")
+    for _ in range(100):
+        actions = np.ones(env.num_actions)
         obs = env.step(actions)
-    
-    # Example: Move all joints to minimum
-    print("Moving all joints to minimum (0.0)...")
-    for step in range(100):
-        actions = np.zeros(env.num_actions)  # All joints at minimum
+        if env.render_mode == "human":
+            env.render()
+
+    # Batched actions: (n_envs, num_actions)
+    print("Moving all joints to minimum (0.0) in all envs...")
+    for _ in range(100):
+        actions = np.zeros((env.n_envs, env.num_actions))
         obs = env.step(actions)
-    
-    # Example: Random walk
-    print("Performing random walk...")
+        if env.render_mode == "human":
+            env.render()
+
+    # Random walk
+    print("Performing random walk (different action per env)...")
     np.random.seed(42)
-    while True:
-        # Random actions in [0, 1]
-        actions = np.random.rand(env.num_actions)
+    for step in range(200):
+        actions = np.random.rand(env.n_envs, env.num_actions).astype(np.float32)
         obs = env.step(actions)
-        
+        if env.render_mode == "human":
+            env.render()
         if step % 50 == 0:
-            print(f"Step {step}: normalized positions = {obs['normalized_positions']}")
-    
+            print(
+                f"Step {step}: normalized positions (env 0) = "
+                f"{obs['normalized_positions'][0]}"
+            )
+
+    if env.render_mode == "rgb_array":
+        frame = env.render()
+        if frame is not None:
+            try:
+                import matplotlib.pyplot as plt
+                plt.imshow(frame)
+                plt.axis("off")
+                plt.title("SpottyEnv (rgb_array)")
+                plt.tight_layout()
+                plt.savefig("spotty_env_frame.png", dpi=100, bbox_inches="tight")
+                print("\nSaved last frame to spotty_env_frame.png")
+            except ImportError:
+                print("\nmatplotlib not installed; skipping save of rgb_array frame")
+
+    env.close()
     print("\nExample completed!")
 
 
