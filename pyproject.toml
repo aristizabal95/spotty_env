@@ -1,3 +1,7 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "spotty-env"
 version = "0.1.0"
@@ -11,3 +15,7 @@ dependencies = [
     "markupsafe<3.0.0", # Pin to version compatible with Python 3.11
     "matplotlib>=3.10.8",
 ]
+
+[tool.hatch.build.targets.wheel]
+packages = ["spotty_env"]
+# All files under spotty_env/ are included (Python files, robot/*.urdf, robot/meshes/*, etc.)
