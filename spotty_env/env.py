@@ -4,28 +4,21 @@ Spotty Environment for Genesis Physics Simulator
 Based on Go2Env from Genesis examples:
 https://github.com/Genesis-Embodied-AI/Genesis/blob/main/examples/locomotion/go2_env.py
 
-This environment provides a class-based interface for controlling the Spotty robot,
-with normalized action space [0, 1] for each of the 12 revolute joints.
+This environment provides a Gymnasium-compatible interface for controlling the Spotty
+robot, with normalized action space [0, 1] for each of the 12 revolute joints.
 """
 
 import pathlib
 import numpy as np
 
-try:
-    import genesis as gs
-    # Try to initialize Genesis if init function exists
-    if hasattr(gs, 'init'):
-        gs.init()
-except ImportError as exc:
-    raise ImportError(
-        "Genesis physics simulator not found. "
-        "Please install the correct Genesis physics simulator package. "
-        "Check: https://genesis-world.readthedocs.io/en/latest/"
-        "user_guide/overview/installation.html"
-    ) from exc
+import gymnasium as gym
+from gymnasium import spaces
+
+import genesis as gs
+gs.init()
 
 
-class SpottyEnv:
+class SpottyEnv(gym.Env):
     """
     Environment for controlling the Spotty robot in Genesis simulator.
 
@@ -75,6 +68,7 @@ class SpottyEnv:
             raise ValueError(
                 f"render_mode must be one of {self.metadata['render_modes']}, got {render_mode!r}"
             )
+        # gym.Env has no __init__, so we set render_mode ourselves
         self.render_mode = render_mode
         self._render_res = render_res
 
@@ -169,10 +163,13 @@ class SpottyEnv:
         # Set up PD control
         self._setup_control()
 
+        # Gymnasium spaces (for one environment)
+        self._build_spaces()
+
         # Get initial DOF positions and convert to numpy array (handles CUDA tensors)
         initial_pos = self.robot.get_dofs_position()
         self.initial_dofs_position = initial_pos.cpu().numpy()
-        
+
         print(
             f"SpottyEnv initialized with {self.num_actions} controllable joints "
             f"and {self.n_envs} parallel envs"
@@ -216,10 +213,46 @@ class SpottyEnv:
         """Set up PD control gains."""
         kp_values = np.array([self.kp_gain] * self.num_actions)
         kv_values = np.array([self.kv_gain] * self.num_actions)
-        
+
         self.robot.set_dofs_kp(kp=kp_values, dofs_idx_local=self.motors_dof_idx)
         self.robot.set_dofs_kv(kv=kv_values, dofs_idx_local=self.motors_dof_idx)
-    
+
+    def _build_spaces(self):
+        """Build Gymnasium observation_space and action_space (single env)."""
+        low = np.array(self.joint_lower_limits, dtype=np.float32)
+        high = np.array(self.joint_upper_limits, dtype=np.float32)
+        # Joint velocities: use a large bound (rad/s)
+        vel_bound = 50.0
+        # Base position: large bound (meters)
+        pos_bound = 100.0
+        # Quaternion: each component in [-1, 1]
+        self.observation_space = spaces.Dict(
+            {
+                "joint_positions": spaces.Box(low=low, high=high, dtype=np.float32),
+                "normalized_positions": spaces.Box(
+                    low=0.0, high=1.0, shape=(self.num_actions,), dtype=np.float32
+                ),
+                "joint_velocities": spaces.Box(
+                    low=-vel_bound,
+                    high=vel_bound,
+                    shape=(self.num_actions,),
+                    dtype=np.float32,
+                ),
+                "base_position": spaces.Box(
+                    low=-pos_bound, high=pos_bound, shape=(3,), dtype=np.float32
+                ),
+                "base_quaternion": spaces.Box(
+                    low=-1.0, high=1.0, shape=(4,), dtype=np.float32
+                ),
+            }
+        )
+        self.action_space = spaces.Box(
+            low=0.0,
+            high=1.0,
+            shape=(self.num_actions,),
+            dtype=np.float32,
+        )
+
     def normalized_to_joint_angles(self, actions):
         """
         Convert normalized actions [0, 1] to joint angles in radians.
@@ -289,19 +322,22 @@ class SpottyEnv:
         actions = np.abs(actions - self.joint_reverse)
         return actions
     
-    def step(self, actions):
+    def step(self, action):
         """
         Step the simulation with normalized actions.
 
         Args:
-            actions: Array of shape (num_actions,) or (n_envs, num_actions)
+            action: Array of shape (num_actions,) or (n_envs, num_actions)
                     in [0, 1]. If 1D, the same action is applied to all envs.
 
         Returns:
-            dict: Batched observations; each value has shape (n_envs, ...).
+            observation: Dict of batched state; each value has shape (n_envs, ...).
+            reward: float (or array of shape (n_envs,) when n_envs > 1, for vector use).
+            terminated: bool (or (n_envs,) when n_envs > 1).
+            truncated: bool (or (n_envs,) when n_envs > 1).
+            info: dict (may contain batched extras when n_envs > 1).
         """
-        joint_angles = self.normalized_to_joint_angles(actions)
-        # Genesis expects first dimension = n_envs; ensure contiguous array
+        joint_angles = self.normalized_to_joint_angles(action)
         joint_angles = np.ascontiguousarray(joint_angles, dtype=np.float32)
 
         for _ in range(self.num_scene_steps_per_env_step):
@@ -311,7 +347,16 @@ class SpottyEnv:
             )
             self.scene.step()
 
-        return self.get_observations()
+        obs = self.get_observations()
+        reward = np.zeros(self.n_envs, dtype=np.float32)
+        terminated = np.zeros(self.n_envs, dtype=bool)
+        truncated = np.zeros(self.n_envs, dtype=bool)
+        info = {}
+
+        if self.n_envs == 1:
+            obs_single = {k: np.squeeze(v, axis=0) for k, v in obs.items()}
+            return obs_single, float(reward[0]), bool(terminated[0]), bool(truncated[0]), info
+        return obs, reward, terminated, truncated, info
     
     def get_observations(self):
         """
@@ -363,27 +408,29 @@ class SpottyEnv:
 
         return obs
     
-    def reset(self):
+    def reset(self, seed=None, options=None):
         """
         Reset the simulation to initial state.
-        
+
         Args:
-            initial_actions: Optional initial normalized actions [0, 1].
-                           If None, uses middle positions (0.5 for all joints)
-        
+            seed: Optional RNG seed (passed to Gymnasium).
+            options: Optional dict (unused).
+
         Returns:
-            dict: Initial observations
+            observation: Dict of (batched) state; each value shape (n_envs, ...).
+            info: dict.
         """
-        # Reset robot to initial pose (initial_dofs_position is already numpy array)
+        super().reset(seed=seed)
         self.robot.set_dofs_position(self.initial_dofs_position)
-        
-        # Reset velocities if possible (initial_dofs_position is numpy, so zeros_like works)
         zero_velocities = np.zeros_like(self.initial_dofs_position)
         self.robot.set_dofs_velocity(zero_velocities)
-        
         self.scene.step()
-        
-        return self.get_observations()
+        obs = self.get_observations()
+        info = {}
+        if self.n_envs == 1:
+            obs_single = {k: np.squeeze(v, axis=0) for k, v in obs.items()}
+            return obs_single, info
+        return obs, info
     
     def render(self):
         """
@@ -437,7 +484,7 @@ def main():
     print("\n=== Example: Moving joints with normalized actions (batched) ===")
     print(f"Render mode: {env.render_mode!r}")
 
-    obs = env.reset()
+    obs, info = env.reset()
     print(f"Initial normalized positions shape: {obs['normalized_positions'].shape}")
     print(f"Initial normalized positions (env 0): {obs['normalized_positions'][0]}")
 
@@ -445,7 +492,7 @@ def main():
     print("\nMoving all joints to maximum (1.0) in all envs...")
     for _ in range(100):
         actions = np.ones(env.num_actions)
-        obs = env.step(actions)
+        obs, reward, terminated, truncated, info = env.step(actions)
         if env.render_mode == "human":
             env.render()
 
@@ -453,16 +500,19 @@ def main():
     print("Moving all joints to minimum (0.0) in all envs...")
     for _ in range(100):
         actions = np.zeros((env.n_envs, env.num_actions))
-        obs = env.step(actions)
+        obs, reward, terminated, truncated, info = env.step(actions)
         if env.render_mode == "human":
             env.render()
 
     # Random walk
     print("Performing random walk (different action per env)...")
-    np.random.seed(42)
     for step in range(200):
-        actions = np.random.rand(env.n_envs, env.num_actions).astype(np.float32)
-        obs = env.step(actions)
+        actions = env.action_space.sample()
+        if env.n_envs > 1:
+            actions = np.broadcast_to(
+                actions[np.newaxis, :], (env.n_envs, env.num_actions)
+            ).copy()
+        obs, reward, terminated, truncated, info = env.step(actions)
         if env.render_mode == "human":
             env.render()
         if step % 50 == 0:
